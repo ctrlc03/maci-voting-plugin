@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-pragma solidity ^0.8.8;
+pragma solidity ^0.8.20;
 
 import {PermissionLib} from "@aragon/osx-commons-contracts/src/permission/PermissionLib.sol";
 import {ProxyLib} from "@aragon/osx-commons-contracts/src/utils/deployment/ProxyLib.sol";
@@ -8,17 +8,19 @@ import {PluginUpgradeableSetup} from "@aragon/osx-commons-contracts/src/plugin/s
 import {IPluginSetup} from "@aragon/osx-commons-contracts/src/plugin/setup/IPluginSetup.sol";
 import {IDAO} from "@aragon/osx-commons-contracts/src/dao/IDAO.sol";
 
-import {MyPlugin} from "./MyPlugin.sol";
+import {DomainObjs} from "maci-contracts/contracts/utilities/DomainObjs.sol";
+import {MaciVoting} from "./MaciVotingPlugin.sol";
+import {IMaciVotingPlugin} from "./IMaciVotingPlugin.sol";
 
-/// @title MyPluginSetup
+/// @title MaciVotingPluginSetup
 /// @dev Release 1, Build 1
-contract MyPluginSetup is PluginUpgradeableSetup {
+contract MaciVotingPluginSetup is PluginUpgradeableSetup {
     using ProxyLib for address;
 
-    /// @notice Constructs the `PluginUpgradeableSetup` by storing the `MyPlugin` implementation address.
+    /// @notice Constructs the `PluginUpgradeableSetup` by storing the `MaciVotingPlugin` implementation address.
     /// @dev The implementation address is used to deploy UUPS proxies referencing it and
     /// to verify the plugin on the respective block explorers.
-    constructor() PluginUpgradeableSetup(address(new MyPlugin())) {}
+    constructor() PluginUpgradeableSetup(address(new MaciVoting())) {}
 
     /// @notice The ID of the permission required to call the `storeNumber` function.
     bytes32 internal constant STORE_PERMISSION_ID = keccak256("STORE_PERMISSION");
@@ -28,10 +30,14 @@ contract MyPluginSetup is PluginUpgradeableSetup {
         address _dao,
         bytes memory _data
     ) external returns (address plugin, PreparedSetupData memory preparedSetupData) {
-        uint256 number = abi.decode(_data, (uint256));
+        (
+            address maci,
+            DomainObjs.PubKey memory publicKey,
+            IMaciVotingPlugin.VotingSettings memory votingSettings
+        ) = abi.decode(_data, (address, DomainObjs.PubKey, IMaciVotingPlugin.VotingSettings));
 
         plugin = IMPLEMENTATION.deployUUPSProxy(
-            abi.encodeCall(MyPlugin.initialize, (IDAO(_dao), number))
+            abi.encodeCall(MaciVoting.initialize, (IDAO(_dao), maci, publicKey, votingSettings))
         );
 
         PermissionLib.MultiTargetPermission[]
