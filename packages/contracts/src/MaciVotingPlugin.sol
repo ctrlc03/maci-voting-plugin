@@ -11,6 +11,7 @@ import {IVotesUpgradeable} from "@openzeppelin/contracts-upgradeable/governance/
 import {SafeCastUpgradeable} from "@openzeppelin/contracts-upgradeable/utils/math/SafeCastUpgradeable.sol";
 import {IERC20Upgradeable} from "@openzeppelin/contracts-upgradeable/token/ERC20/IERC20Upgradeable.sol";
 import {IMACI} from "maci-contracts/contracts/interfaces/IMACI.sol";
+import {IPoll} from "maci-contracts/contracts/interfaces/IPoll.sol";
 import {Params} from "maci-contracts/contracts/utilities/Params.sol";
 import {DomainObjs} from "maci-contracts/contracts/utilities/DomainObjs.sol";
 
@@ -20,6 +21,7 @@ import {DomainObjs} from "maci-contracts/contracts/utilities/DomainObjs.sol";
 /// Voters can vote for option 0 or 1 (yes or no)
 /// Abstain - signed up but not voted (needs changes in the MACI protocol to keep track of that)
 /// What about minimum participation?
+/// TODO: Maybe inheriting from MACI directly?
 contract MaciVoting is PluginUUPSUpgradeable, ProposalUpgradeable, IMaciVotingPlugin {
     using SafeCastUpgradeable for uint256;
 
@@ -67,11 +69,15 @@ contract MaciVoting is PluginUUPSUpgradeable, ProposalUpgradeable, IMaciVotingPl
     /// @param parameters The proposal parameters at the time of the proposal creation.
     /// @param actions The actions to be executed when the proposal passes.
     /// @param allowFailureMap A bitmap allowing the proposal to succeed, even if individual actions might revert. If the bit at index `i` is 1, the proposal succeeds even if the `i`th action reverts. A failure map value of 0 requires every action to not revert.
+    /// @param pollId The ID of the MACI poll
+    /// @param pollAddress The address of the MACI poll
     struct Proposal {
         bool executed;
         ProposalParameters parameters;
         IDAO.Action[] actions;
         uint256 allowFailureMap;
+        uint256 pollId;
+        address pollAddress;
     }
 
     /// @notice Disables the initializers on the implementation contract to prevent it from being left uninitialized.
@@ -115,13 +121,11 @@ contract MaciVoting is PluginUUPSUpgradeable, ProposalUpgradeable, IMaciVotingPl
     /// @notice Creates a proposal.
     /// @param _metadata The metadata of the proposal.
     /// @param _actions The actions of the proposal.
-    /// @param _allowFailureMap The allow failure map of the proposal.
     /// @param _startDate The start date of the proposal.
     /// @param _endDate The end date of the proposal.
     function createProposal(
         bytes calldata _metadata,
         IDAO.Action[] calldata _actions,
-        uint256 _allowFailureMap,
         uint64 _startDate,
         uint64 _endDate
     ) external returns (uint256 proposalId) {
@@ -160,31 +164,8 @@ contract MaciVoting is PluginUUPSUpgradeable, ProposalUpgradeable, IMaciVotingPl
             _startDate: _startDate,
             _endDate: _endDate,
             _actions: _actions,
-            _allowFailureMap: _allowFailureMap
+            _allowFailureMap: 0
         });
-
-        // Store proposal related information
-        Proposal storage proposal_ = proposals[proposalId];
-
-        proposal_.parameters.startDate = _startDate;
-        proposal_.parameters.endDate = _endDate;
-        proposal_.parameters.snapshotBlock = snapshotBlock.toUint64();
-        proposal_.parameters.minVotingPower = _applyRatioCeiled(
-            totalVotingPower_,
-            minParticipation()
-        );
-
-        // Reduce costs
-        if (_allowFailureMap != 0) {
-            proposal_.allowFailureMap = _allowFailureMap;
-        }
-
-        for (uint256 i; i < _actions.length; ) {
-            proposal_.actions.push(_actions[i]);
-            unchecked {
-                ++i;
-            }
-        }
 
         Params.TreeDepths memory treeDepths = Params.TreeDepths({
             intStateTreeDepth: 2,
@@ -196,7 +177,8 @@ contract MaciVoting is PluginUUPSUpgradeable, ProposalUpgradeable, IMaciVotingPl
 
         // Arguments to deploy a poll
         IMACI.DeployPollArgs memory deployPollArgs = IMACI.DeployPollArgs({
-            duration: _endDate - _startDate,
+            startDate: _startDate,
+            endDate: _endDate,
             treeDepths: treeDepths,
             messageBatchSize: 20,
             coordinatorPubKey: coordinatorPubKey,
@@ -205,26 +187,56 @@ contract MaciVoting is PluginUUPSUpgradeable, ProposalUpgradeable, IMaciVotingPl
             mode: DomainObjs.Mode.NON_QV,
             gatekeeper: address(this),
             initialVoiceCreditProxy: address(this),
-            relayers: relayers
+            relayers: relayers,
+            // yes - no - abstain 
+            voteOptions: 3
         });
 
-        IMACI(maci).deployPoll(deployPollArgs);
+        uint256 pollId = IMACI(maci).nextPollId();
+        IMACI.PollContracts memory pollContracts = IMACI(maci).deployPoll(deployPollArgs);
+
+        /// @todo follow checks effects interactions and move this before (can take poll id before deploying though still external call first)
+        // Store proposal related information
+        Proposal storage proposal_ = proposals[proposalId];
+
+        proposal_.parameters.startDate = _startDate;
+        proposal_.parameters.endDate = _endDate;
+        proposal_.parameters.snapshotBlock = snapshotBlock.toUint64();
+        proposal_.parameters.minVotingPower = _applyRatioCeiled(
+            totalVotingPower_,
+            minParticipation()
+        );
+
+        proposal_.pollId = pollId;
+        proposal_.pollAddress = pollContracts.poll;
+
+        for (uint256 i; i < _actions.length; ) {
+            proposal_.actions.push(_actions[i]);
+            unchecked {
+                ++i;
+            }
+        }
     }
 
     /// @notice Votes for a proposal.
     /// @param _proposalId The ID of the proposal.
-    function vote(uint256 _proposalId) public {
+    /// @param _message The message containing your encrypted vote
+    /// @param _encPubKey The public key of the voter
+    function vote(uint256 _proposalId, DomainObjs.Message calldata _message, DomainObjs.PubKey calldata _encPubKey ) public {
         Proposal memory proposal_ = proposals[_proposalId];
+
+        IPoll(proposal_.pollAddress).publishMessage(_message, _encPubKey);
     }
 
     /**
      * Gatekeeper function to register users
      */
-    function register(address _address, bytes memory _data) public {}
+    function register(DomainObjs.PubKey calldata _pubKey, bytes memory _signUpGatekeeperData) public {
+        maci.signUp(_pubKey, _signUpGatekeeperData);
+    }
 
-    /**
-     * Function to get the voice credits of a user based on their token balances
-     */
+    /// @notice Function to get the voice credits of a user based on their token balances
+    /// @dev Delegate voting power TODO
     function getVoiceCredits(address _address, bytes memory _data) public view returns (uint256) {
         uint256 snapshotBlock = abi.decode(_data, (uint256));
         uint256 votingPower = votingToken.getPastVotes(_address, snapshotBlock);
